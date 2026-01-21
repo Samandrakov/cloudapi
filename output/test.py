@@ -6,7 +6,7 @@ import grpc
 import yandex.cloud.ai.stt.v3.stt_pb2 as stt_pb2
 import yandex.cloud.ai.stt.v3.stt_service_pb2_grpc as stt_service_pb2_grpc
 
-CHUNK_SIZE = 4000
+CHUNK_SIZE = 32000
 
 def gen(audio_file_name):
     # Задайте настройки распознавания.
@@ -15,7 +15,7 @@ def gen(audio_file_name):
             audio_format=stt_pb2.AudioFormatOptions(
                 raw_audio=stt_pb2.RawAudio(
                     audio_encoding=stt_pb2.RawAudio.LINEAR16_PCM,
-                    sample_rate_hertz=8000,
+                    sample_rate_hertz=48000,
                     audio_channel_count=1
                 )
             ),
@@ -42,24 +42,15 @@ def gen(audio_file_name):
             yield stt_pb2.StreamingRequest(chunk=stt_pb2.AudioChunk(data=data))
             data = f.read(CHUNK_SIZE)
 
-# Вместо iam_token передавайте api_key при авторизации с API-ключом
-# от имени сервисного аккаунта.
 def run(api_key, audio_file_name):
-# def run(iam_token, audio_file_name):
-    # Установите соединение с сервером.
     cred = grpc.ssl_channel_credentials()
     channel = grpc.secure_channel('stt.api.cloud.yandex.net:443', cred)
     stub = stt_service_pb2_grpc.RecognizerStub(channel)
 
-    # Отправьте данные для распознавания.
     it = stub.RecognizeStreaming(gen(audio_file_name), metadata=(
-    # Параметры для авторизации с IAM-токеном
-    #     ('authorization', f'Bearer {iam_token}'),
-    # Параметры для авторизации с API-ключом от имени сервисного аккаунта
       ('authorization', f'Api-Key {api_key}'),
     ))
 
-    # Обработайте ответы сервера и выведите результат в консоль.
     try:
         for r in it:
             event_type, alternatives = r.WhichOneof('Event'), None
