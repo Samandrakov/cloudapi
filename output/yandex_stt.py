@@ -11,9 +11,20 @@ import yandex.cloud.ai.stt.v3.stt_pb2 as stt_pb2
 import yandex.cloud.ai.stt.v3.stt_service_pb2_grpc as stt_service_pb2_grpc
 
 
-from typing import Generator, List, Tuple, Optional
+from typing import Generator, List, Tuple
 from utils.logger import logger
 from config.settings import settings
+
+
+# gRPC channel options для длинных стримов
+GRPC_CHANNEL_OPTIONS = [
+    ('grpc.max_send_message_length', 100 * 1024 * 1024),    # 100 MB
+    ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100 MB
+    ('grpc.keepalive_time_ms', 30_000),                       # пинг каждые 30с
+    ('grpc.keepalive_timeout_ms', 10_000),                    # ждём ответ 10с
+    ('grpc.keepalive_permit_without_calls', 1),               # пинг даже без активных вызовов
+    ('grpc.http2.max_pings_without_data', 0),                 # без ограничений на пинги
+]
 
 
 class YandexSTTClient:
@@ -43,16 +54,14 @@ class YandexSTTClient:
                     restriction_type=stt_pb2.LanguageRestrictionOptions.WHITELIST,
                     language_code=['ru-RU']
                 ),
-                audio_processing_type=stt_pb2.RecognitionModelOptions.REAL_TIME
+                audio_processing_type=stt_pb2.RecognitionModelOptions.FULL_DATA
             )
         )
 
     def _audio_generator(self, audio_file_path: str) -> Generator[stt_pb2.StreamingRequest, None, None]:
         """Генератор для потоковой передачи аудио"""
-        # Отправляем настройки
         yield stt_pb2.StreamingRequest(session_options=self._create_streaming_options())
 
-        # Читаем и отправляем аудио чанками
         with open(audio_file_path, 'rb') as f:
             while True:
                 data = f.read(settings.CHUNK_SIZE)
@@ -60,19 +69,16 @@ class YandexSTTClient:
                     break
                 yield stt_pb2.StreamingRequest(chunk=stt_pb2.AudioChunk(data=data))
 
-    def transcribe(self, audio_file_path: str, save_intermediate: bool = False) -> Tuple[str, List[str]]:
-        """
-        Транскрибирование аудиофайла
-        Returns: (full_text, segments)
-        """
-        self.logger.info(f"Начало транскрибирования файла: {audio_file_path}")
+    def _transcribe_single(self, audio_file_path: str, save_intermediate: bool = False) -> Tuple[str, List[str]]:
+        """Транскрибирование одного аудиофайла (сегмента)."""
+        self.logger.info(f"Начало транскрибирования: {audio_file_path}")
 
-        # Настраиваем соединение
         cred = grpc.ssl_channel_credentials()
-        channel = grpc.secure_channel(settings.YANDEX_ENDPOINT, cred)
+        channel = grpc.secure_channel(
+            settings.YANDEX_ENDPOINT, cred, options=GRPC_CHANNEL_OPTIONS
+        )
         stub = stt_service_pb2_grpc.RecognizerStub(channel)
 
-        # Запускаем распознавание
         stream = stub.RecognizeStreaming(
             self._audio_generator(audio_file_path),
             metadata=(('authorization', f'Api-Key {self.api_key}'),)
@@ -94,7 +100,7 @@ class YandexSTTClient:
                 elif event_type == 'final' and len(response.final.alternatives) > 0:
                     text = response.final.alternatives[0].text
                     segments.append(text)
-                    self.logger.info(f"Добавлен финальный сегмент ({len(segments)}): {text}")
+                    self.logger.info(f"Финальный сегмент ({len(segments)}): {text[:80]}...")
 
                 elif event_type == 'final_refinement':
                     if len(response.final_refinement.normalized_text.alternatives) > 0:
@@ -104,9 +110,35 @@ class YandexSTTClient:
         except grpc._channel._Rendezvous as err:
             self.logger.error(f"Ошибка gRPC: код={err._state.code}, сообщение={err._state.details}")
             raise
+        finally:
+            channel.close()
 
         full_text = ' '.join(segments)
-
         self.logger.info(f"Транскрибирование завершено. Сегментов: {len(segments)}, символов: {len(full_text)}")
 
         return full_text, segments
+
+    def transcribe(self, audio_file_path: str, save_intermediate: bool = False) -> Tuple[str, List[str]]:
+        """
+        Транскрибирование аудиофайла.
+        Если передан список сегментов — обрабатывает каждый последовательно.
+        Returns: (full_text, segments)
+        """
+        return self._transcribe_single(audio_file_path, save_intermediate)
+
+    def transcribe_segments(self, segment_paths: List[str], save_intermediate: bool = False) -> Tuple[str, List[str]]:
+        """
+        Транскрибирование нескольких сегментов последовательно.
+        Returns: (full_text, all_segments)
+        """
+        all_segments = []
+        for i, path in enumerate(segment_paths):
+            self.logger.info(f"Обработка сегмента {i+1}/{len(segment_paths)}: {path}")
+            _, segments = self._transcribe_single(path, save_intermediate)
+            all_segments.extend(segments)
+
+        full_text = ' '.join(all_segments)
+        self.logger.info(
+            f"Все сегменты обработаны. Итого: {len(all_segments)} фрагментов, {len(full_text)} символов"
+        )
+        return full_text, all_segments
